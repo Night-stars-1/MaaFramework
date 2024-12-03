@@ -21,6 +21,10 @@ Tasker::Tasker(MaaNotificationCallback notify, void* notify_trans_arg)
 Tasker::~Tasker()
 {
     LogFunc;
+
+    if (task_runner_) {
+        task_runner_->wait_all();
+    }
 }
 
 bool Tasker::bind_resource(MaaResource* resource)
@@ -93,9 +97,10 @@ MaaStatus Tasker::wait(MaaTaskId task_id) const
     return task_runner_->status(runner_id);
 }
 
-MaaBool Tasker::running() const
+bool Tasker::running() const
 {
-    return resource_ && resource_->running() && controller_ && controller_->running() && task_runner_ && task_runner_->running();
+    return resource_ && resource_->running() && controller_ && controller_->running() && task_runner_ && task_runner_->running()
+           && !running_task_;
 }
 
 void Tasker::post_stop()
@@ -132,7 +137,11 @@ void Tasker::clear_cache()
 {
     LogTrace;
 
-    task_id_mapping_.clear();
+    {
+        std::unique_lock lock(task_id_mapping_mutex_);
+        task_id_mapping_.clear();
+    }
+
     runtime_cache().clear();
 }
 
@@ -184,8 +193,18 @@ MaaTaskId Tasker::post_task(TaskPtr task_ptr, const json::value& pipeline_overri
         return MaaInvalidId;
     }
 
-    task_ptr->override_pipeline(pipeline_override);
     MaaTaskId task_id = task_ptr->task_id();
+    bool ov = task_ptr->override_pipeline(pipeline_override);
+    if (!ov) {
+        LogError << "failed to override_pipeline" << VAR(task_id) << VAR(task_ptr->entry()) << VAR(pipeline_override);
+        return MaaInvalidId;
+    }
+
+    runtime_cache_.set_task_detail(
+        task_id,
+        MAA_TASK_NS::TaskDetail { .task_id = task_id, .entry = task_ptr->entry(), .status = MaaStatus_Pending });
+
+    std::unique_lock lock(task_id_mapping_mutex_);
 
     RunnerId runner_id = task_runner_->post(task_ptr);
     task_id_mapping_.emplace(task_id, runner_id);
@@ -211,21 +230,34 @@ bool Tasker::run_task(RunnerId runner_id, TaskPtr task_ptr)
         return false;
     }
 
+    MaaTaskId task_id = task_ptr->task_id();
+    const std::string& entry = task_ptr->entry();
     const json::value cb_detail = {
-        { "task_id", task_ptr->task_id() },
-        { "entry", task_ptr->entry() },
+        { "task_id", task_id },
+        { "entry", entry },
         { "hash", resource_ ? resource_->get_hash() : std::string() },
         { "uuid", controller_ ? controller_->get_uuid() : std::string() },
     };
 
-    notifier.notify(MaaMsg_Tasker_Task_Starting, cb_detail);
-
     LogInfo << "task start:" << VAR(cb_detail);
+
+    {
+        // value_or 的默认值用于在 post 之后调用方手动 clear cache 了的情况
+        auto task_detail = runtime_cache_.get_task_detail(task_id).value_or(MAA_TASK_NS::TaskDetail { .task_id = task_id, .entry = entry });
+        task_detail.status = MaaStatus_Running;
+        runtime_cache_.set_task_detail(task_id, std::move(task_detail));
+    }
+    notifier.notify(MaaMsg_Tasker_Task_Starting, cb_detail);
 
     bool ret = task_ptr->run();
 
     LogInfo << "task end:" << VAR(cb_detail) << VAR(ret);
-
+    {
+        // value_or 的默认值用于 run 到一半调用方手动 clear cache 了的情况
+        auto task_detail = runtime_cache_.get_task_detail(task_id).value_or(MAA_TASK_NS::TaskDetail { .task_id = task_id, .entry = entry });
+        task_detail.status = ret ? MaaStatus_Succeeded : MaaStatus_Failed;
+        runtime_cache_.set_task_detail(task_id, std::move(task_detail));
+    }
     notifier.notify(ret ? MaaMsg_Tasker_Task_Succeeded : MaaMsg_Tasker_Task_Failed, cb_detail);
 
     running_task_ = nullptr;
@@ -252,10 +284,12 @@ bool Tasker::check_stop()
 
 Tasker::RunnerId Tasker::task_id_to_runner_id(MaaTaskId task_id) const
 {
+    std::shared_lock lock(task_id_mapping_mutex_);
+
     auto iter = task_id_mapping_.find(task_id);
     if (iter == task_id_mapping_.end()) {
         LogError << "runner id not found" << VAR(task_id);
-        return {};
+        return MaaInvalidId;
     }
     return iter->second;
 }

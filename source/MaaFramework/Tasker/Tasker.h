@@ -2,7 +2,7 @@
 
 #include <map>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <vector>
 
 #include "API/MaaTypes.h"
@@ -35,7 +35,7 @@ public:
     virtual MaaStatus status(MaaTaskId task_id) const override;
     virtual MaaStatus wait(MaaTaskId task_id) const override;
 
-    virtual MaaBool running() const override;
+    virtual bool running() const override;
     virtual void post_stop() override;
 
     virtual MAA_RES_NS::ResourceMgr* resource() const override;
@@ -70,8 +70,8 @@ private:
 
     std::unique_ptr<AsyncRunner<TaskPtr>> task_runner_ = nullptr;
 
-    // 这个 map 的操作理论上是要加锁的，但目前所有调用都在主线程（依赖调用方），所以暂时不加锁
     std::map<MaaTaskId, RunnerId> task_id_mapping_;
+    mutable std::shared_mutex task_id_mapping_mutex_;
 
     TaskPtr running_task_ = nullptr;
 
